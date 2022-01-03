@@ -173,12 +173,8 @@ mod tests {
         let j = JinjaSqlBuilder::new().build();
 
         let query_string = indoc! {"
-        select * from
-            (
             select * from {{ table_name | upper }}
             where x in {{ other_items | reverse | inclause }}
-        )a
-        where column in {{ items | inclause }}
     "};
 
         let (res, context) = j
@@ -201,27 +197,53 @@ mod tests {
     fn test_complex_render() {
         let j = JinjaSqlBuilder::new().build();
         let query_string = indoc! {"
-        select * from
+        select {% for col in columns %}
+            {{ col }}{%- if not loop.last %},{% endif %}{% endfor %}
+        from
             (
-            select * from {{ table_name | upper }}
-            where x in {{ other_items | inclause }}
+            select {% for col in columns %}
+            {{ col }}{%- if not loop.last %},{% endif %}{% endfor %} from {{ table_name | upper }}
+            where sku in {{ skus | inclause }}
         )a
-        where column in {{ items | reverse | inclause }} and other_column = '{{ baz | bind }}'
+        where 
+            tag in {{ tags | reverse | inclause }}
+            and stock_date = {{ baz | bind }}
         "};
 
         let (res, context) = j
             .render_query(
                 query_string,
                 context!(
-                    table_name => "mytable",
-                    items => vec!["a", "b", "c"],
-                    other_items => vec!["d", "e", "f"],
-                    baz => "baz"
+                    columns => vec!["apple", "lettuce", "lemon"],
+                    table_name => "orders.stock_data",
+                    tags => vec!["moldy", "sweet", "fresh"],
+                    skus => vec!["EE-001", "EA-001", "BA-001"],
+                    baz => "2022-01-01"
                 ),
             )
             .unwrap();
 
         println!("{}", res);
         println!("{:?}", context);
+
+        assert_eq!(res, indoc! {
+            "select 
+            apple,
+            lettuce,
+            lemon
+        from
+            (
+            select 
+            apple,
+            lettuce,
+            lemon from ORDERS.STOCK_DATA
+            where sku in ($1, $2, $3)
+        )a
+        where 
+            tag in ($4, $5, $6)
+            and stock_date = $7"
+        });
+
+        assert_eq!(context, vec!["EE-001", "EA-001", "BA-001", "fresh", "sweet", "moldy", "2022-01-01"]);
     }
 }
