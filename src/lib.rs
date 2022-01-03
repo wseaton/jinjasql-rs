@@ -193,7 +193,6 @@ mod tests {
 
     // test combining the inclause and naked bind
     #[test]
-
     fn test_complex_render() {
         let j = JinjaSqlBuilder::new().build();
         let query_string = indoc! {"
