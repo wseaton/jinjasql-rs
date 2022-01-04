@@ -1,0 +1,11 @@
+select{% for col in columns %}
+    {{ col }}{%- if not loop.last %},{% endif %}{% endfor %}
+from
+    (
+    select {% for col in columns %}
+    {{ col }}{%- if not loop.last %},{% endif %}{% endfor %} from {{ table_name | upper }}
+    where sku in {{ skus | inclause }}
+)a
+where 
+    tag in {{ tags | reverse | inclause }}
+    and stock_date = {{ baz | bind }}

@@ -11,8 +11,7 @@ normal = ["anyhow", "indoc"]
 
 [dependencies]
 ref_thread_local = "0.1.1"
-minijinja = "0.10.0"
-hashbrown = "0.11"
+minijinja = {version = "0.10.0", features = ["source"]}
 sha2 = "0.10"
 anyhow = "*"
 indoc = "1.0"

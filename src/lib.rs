@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use minijinja::value::Value;
 use minijinja::Error;
-use minijinja::{Environment, State};
+use minijinja::{Environment, State, Source};
 
 ref_thread_local! {
     static managed CONTEXT: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -47,7 +47,7 @@ pub struct JinjaSql<'a> {
     param_style: ParamStyle,
     identifier_quote_character: IDQuoteChar,
     // currently the top two are not used, but placeholders for settings.
-    env: Environment<'a>,
+    env: Environment<'a>
 }
 
 impl<'a> JinjaSql<'a> {
@@ -63,18 +63,32 @@ impl<'a> JinjaSql<'a> {
         format!("hash:{:x}", hash)
     }
 
-    // make our template from a query string, render it and return back the render query and param vec
+    // make our template from a query string (or template path)
+    // render it and return back the render query and param vec
     pub fn render_query(
         mut self,
-        query: &'a str,
+        query: Option<&'a str>,
+        template_name: Option<&str>,
         context: Value,
     ) -> Result<(String, Vec<String>), Error> {
         
-        let name = JinjaSql::hash_query(&query);
-        let long_lived_name: &'a str = Box::leak(name.into_boxed_str());
+        let tmpl =  
+            if let Some(q) = query {
+                let name = JinjaSql::hash_query(q);
+                // TODO: don't leak (if possible)
+                // we are leaking memory here due to lifetimes, the name of the 
+                // string has to live for the duration of the environment, which we "solve"
+                // by just making it live for the lifetime 'a, which is effectively the length
+                // of the entire progrm. 
+                let long_lived_name: &'a str = Box::leak(name.into_boxed_str());
+                self.env.add_template(long_lived_name, q)?;
+                self.env.get_template(long_lived_name)?
+            } else if let Some(b) = template_name {
+                self.env.get_template(b)?
+            } else {
+                panic!("Unreconcilable issue with template args.")
+        };
         
-        self.env.add_template(long_lived_name, &query)?;
-        let tmpl = self.env.get_template(long_lived_name)?;
         let res = tmpl.render(context)?;
         let ctx = CONTEXT.borrow().lock().unwrap().to_vec();
 
@@ -117,6 +131,7 @@ pub struct JinjaSqlBuilder {
     // Probably lots of optional fields.
     param_style: ParamStyle,
     identifier_quote_character: IDQuoteChar,
+    source: Source
 }
 
 impl JinjaSqlBuilder {
@@ -124,7 +139,13 @@ impl JinjaSqlBuilder {
         JinjaSqlBuilder {
             param_style: ParamStyle::default(),
             identifier_quote_character: IDQuoteChar::default(),
+            source: Source::default()
         }
+    }
+
+    pub fn set_source(mut self, source: Source) -> JinjaSqlBuilder {
+        self.source = source;
+        self
     }
 
     // currently doesn't do anything, as only 'Numeric' is supported in pure rust,
@@ -167,11 +188,12 @@ impl JinjaSqlBuilder {
         let mut j = JinjaSql {
             param_style: self.param_style,
             identifier_quote_character: self.identifier_quote_character,
-            env,
+            env
         };
 
         j.env.add_filter("inclause", bind_in_clause);
         j.env.add_filter("bind", bind);
+        j.env.set_source(self.source);
         j
     }
 }
@@ -180,7 +202,29 @@ impl JinjaSqlBuilder {
 mod tests {
     use crate::JinjaSqlBuilder;
     use indoc::indoc;
-    use minijinja::context;
+    use minijinja::{context, Source};
+
+    #[test]
+    fn test_basic_render_source() {
+        let mut s = Source::new();
+        s.load_from_path("./templates", &["j2"]).unwrap();
+        
+        let j = JinjaSqlBuilder::new().set_source(s).build();        
+        let (res, params) = j
+            .render_query(
+                None,
+                Some("basic.sql.j2"),
+                context!(
+        table_name => "mytable",
+        items => vec!["a", "b", "c"],
+        other_items => vec!["d", "e", "f"]),
+            )
+            .unwrap();
+
+        println!("{}", res);
+        println!("{:?}", params);
+    }
+
 
     #[test]
     fn test_basic_render() {
@@ -191,9 +235,10 @@ mod tests {
             where x in {{ other_items | reverse | inclause }}
     "};
 
-        let (res, context) = j
+        let (res, params) = j
             .render_query(
-                query_string,
+                Some(query_string),
+                None,
                 context!(
         table_name => "mytable",
         items => vec!["a", "b", "c"],
@@ -202,7 +247,7 @@ mod tests {
             .unwrap();
 
         println!("{}", res);
-        println!("{:?}", context);
+        println!("{:?}", params);
     }
 
     // test combining the inclause and naked bind
@@ -223,9 +268,10 @@ mod tests {
             and stock_date = {{ baz | bind }}
         "};
 
-        let (res, context) = j
-            .render_query(
-                query_string,
+        let (res, params) = j
+        .render_query(
+            Some(query_string),
+            None,
                 context!(
                     columns => vec!["apple", "lettuce", "lemon"],
                     table_name => "orders.stock_data",
@@ -237,7 +283,7 @@ mod tests {
             .unwrap();
 
         println!("{}", res);
-        println!("{:?}", context);
+        println!("{:?}", params);
 
         assert_eq!(
             res,
@@ -261,7 +307,7 @@ mod tests {
         );
 
         assert_eq!(
-            context,
+            params,
             vec![
                 "EE-001",
                 "EA-001",
@@ -287,9 +333,10 @@ mod tests {
         thread::spawn(move || {
             println!("Running from thread!");
             let j = JinjaSqlBuilder::new().build();
-            let (res, context) = j
-                .render_query(
-                    query_string,
+            let (res, params) = j
+            .render_query(
+                Some(query_string),
+                None,
                     context!(
                 table_name => "thread",
                 items => vec!["a", "b", "c"],
@@ -297,14 +344,15 @@ mod tests {
                 )
                 .unwrap();
             println!("{}", res);
-            println!("{:?}", context);
+            println!("{:?}", params);
         });
 
         println!("Running from main!");
         let j = JinjaSqlBuilder::new().build();
-        let (res, context) = j
-            .render_query(
-                query_string,
+        let (res, params) = j
+        .render_query(
+            Some(query_string),
+            None,
                 context!(
             table_name => "main",
             items => vec!["a", "b", "c"],
@@ -312,6 +360,6 @@ mod tests {
             )
             .unwrap();
         println!("{}", res);
-        println!("{:?}", context);
+        println!("{:?}", params);
     }
 }
