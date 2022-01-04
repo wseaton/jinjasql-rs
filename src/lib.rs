@@ -1,4 +1,7 @@
-use lazy_static::lazy_static;
+#[macro_use]
+extern crate ref_thread_local;
+use ref_thread_local::RefThreadLocal;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -6,11 +9,10 @@ use minijinja::value::Value;
 use minijinja::Error;
 use minijinja::{Environment, State};
 
-lazy_static! {
-    static ref CONTEXT: Mutex<Vec<String>> = Mutex::new(Vec::new());
+ref_thread_local! {
+    static managed CONTEXT: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static managed PARAM_COUNT: AtomicUsize = AtomicUsize::new(0);
 }
-
-static PARAM_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, PartialEq, Clone)]
 enum ParamStyle {
@@ -53,21 +55,34 @@ impl<'a> JinjaSql<'a> {
         JinjaSqlBuilder::default()
     }
 
+    fn hash_query(query: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(query);
+        let hash = hasher.finalize();
+        format!("hash:{:x}", hash)
+    }
+
     // make our template from a query string, render it and return back the render query and param vec
     pub fn render_query(
         mut self,
         query: &'a str,
         context: Value,
     ) -> Result<(String, Vec<String>), Error> {
-        self.env.add_template("tmp", &query)?;
-        let tmpl = self.env.get_template("tmp")?;
-        let res = tmpl.render(context)?;
-        let ctx = CONTEXT.lock().unwrap().to_vec();
+        let name = JinjaSql::hash_query(&query);
 
-        // clear the context vector to make room for the next query
-        CONTEXT.lock().unwrap().clear();
+        let n = Box::new(name);
+        let static_n: &str = Box::leak(n);
+
+        self.env.add_template(static_n, &query)?;
+        let tmpl = self.env.get_template(static_n)?;
+        let res = tmpl.render(context)?;
+        let ctx = CONTEXT.borrow().lock().unwrap().to_vec();
+
+        // clear the context Vec to make room for the next query
+        CONTEXT.borrow().lock().unwrap().clear();
         // set the param index back to zero
-        PARAM_COUNT.store(0, Ordering::SeqCst);
+        PARAM_COUNT.borrow().store(0, Ordering::SeqCst);
 
         Ok((res, ctx))
     }
@@ -76,8 +91,8 @@ impl<'a> JinjaSql<'a> {
 // filter used for binding a single "naked" variable, outside of an in-clause or identity expression
 // eg. WHERE date = {{ date }} => WHERE date = "2020-10-01"
 pub fn bind(_state: &State, value: String) -> Result<String, Error> {
-    let current_count = PARAM_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
-    CONTEXT.lock().unwrap().push(value.clone());
+    let current_count = PARAM_COUNT.borrow().fetch_add(1, Ordering::SeqCst) + 1;
+    CONTEXT.borrow().lock().unwrap().push(value.clone());
     Ok(format!("${}", current_count))
 }
 
@@ -87,8 +102,8 @@ pub fn bind_in_clause(_state: &State, value: Vec<String>) -> Result<String, Erro
     let mut outputs: Vec<String> = Vec::new();
 
     for val in value {
-        let current_count = PARAM_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
-        CONTEXT.lock().unwrap().push(val);
+        let current_count = PARAM_COUNT.borrow().fetch_add(1, Ordering::SeqCst) + 1;
+        CONTEXT.borrow().lock().unwrap().push(val);
         outputs.push(format!("${}", current_count))
     }
 
@@ -196,7 +211,7 @@ mod tests {
     fn test_complex_render() {
         let j = JinjaSqlBuilder::new().build();
         let query_string = indoc! {"
-        select {% for col in columns %}
+        select{% for col in columns %}
             {{ col }}{%- if not loop.last %},{% endif %}{% endfor %}
         from
             (
@@ -225,8 +240,10 @@ mod tests {
         println!("{}", res);
         println!("{:?}", context);
 
-        assert_eq!(res, indoc! {
-            "select 
+        assert_eq!(
+            res,
+            indoc! { 
+        "select
             apple,
             lettuce,
             lemon
@@ -241,8 +258,61 @@ mod tests {
         where 
             tag in ($4, $5, $6)
             and stock_date = $7"
+            }
+        );
+
+        assert_eq!(
+            context,
+            vec![
+                "EE-001",
+                "EA-001",
+                "BA-001",
+                "fresh",
+                "sweet",
+                "moldy",
+                "2022-01-01"
+            ]
+        );
+    }
+
+    // test to ensure that our 'globals' implementation is thead-safe
+    #[test]
+    fn test_basic_render_threads() {
+        use std::thread;
+
+        let query_string = indoc! {"
+            select * from {{ table_name | upper }}
+            where x in {{ other_items | inclause }}
+    "};
+
+        thread::spawn(move || {
+            println!("Running from thread!");
+            let j = JinjaSqlBuilder::new().build();
+            let (res, context) = j
+                .render_query(
+                    query_string,
+                    context!(
+                table_name => "thread",
+                items => vec!["a", "b", "c"],
+                other_items => vec!["d", "e", "f"]),
+                )
+                .unwrap();
+            println!("{}", res);
+            println!("{:?}", context);
         });
 
-        assert_eq!(context, vec!["EE-001", "EA-001", "BA-001", "fresh", "sweet", "moldy", "2022-01-01"]);
+        println!("Running from main!");
+        let j = JinjaSqlBuilder::new().build();
+        let (res, context) = j
+            .render_query(
+                query_string,
+                context!(
+            table_name => "main",
+            items => vec!["a", "b", "c"],
+            other_items => vec!["d", "e", "f"]),
+            )
+            .unwrap();
+        println!("{}", res);
+        println!("{:?}", context);
     }
 }
