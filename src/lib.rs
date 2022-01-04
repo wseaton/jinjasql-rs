@@ -71,9 +71,8 @@ impl<'a> JinjaSql<'a> {
     ) -> Result<(String, Vec<String>), Error> {
         let name = JinjaSql::hash_query(&query);
 
-        let n = Box::new(name);
-        let static_n: &str = Box::leak(n);
-
+        let static_n: &str = Box::leak(name.into_boxed_str());
+        
         self.env.add_template(static_n, &query)?;
         let tmpl = self.env.get_template(static_n)?;
         let res = tmpl.render(context)?;
