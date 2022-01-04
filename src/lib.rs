@@ -12,12 +12,13 @@ use minijinja::{Environment, State, Source};
 ref_thread_local! {
     static managed CONTEXT: Mutex<Vec<String>> = Mutex::new(Vec::new());
     static managed PARAM_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static managed PARAM_STYLE: ParamStyle = ParamStyle::default();
 }
 
 #[derive(Debug, PartialEq, Clone)]
 enum ParamStyle {
     Numeric,
-    // QMark,
+    QMark,
     // Named,
     // Format,
     // PyFormat,
@@ -103,10 +104,16 @@ impl<'a> JinjaSql<'a> {
 
 // filter used for binding a single "naked" variable, outside of an in-clause or identity expression
 // eg. WHERE date = {{ date }} => WHERE date = "2020-10-01"
-pub fn bind(_state: &State, value: String) -> Result<String, Error> {
+pub fn bind(_state: &State, value: String) -> Result<String, Error> {    
     let current_count = PARAM_COUNT.borrow().fetch_add(1, Ordering::SeqCst) + 1;
     CONTEXT.borrow().lock().unwrap().push(value.clone());
-    Ok(format!("${}", current_count))
+    
+    match *PARAM_STYLE.borrow() {
+        ParamStyle::Numeric => {
+            Ok(format!("${}", current_count))
+        },
+        ParamStyle::QMark => Ok("?".to_string())
+    }
 }
 
 // filter used for generating in-clauses
@@ -117,7 +124,12 @@ pub fn bind_in_clause(_state: &State, value: Vec<String>) -> Result<String, Erro
     for val in value {
         let current_count = PARAM_COUNT.borrow().fetch_add(1, Ordering::SeqCst) + 1;
         CONTEXT.borrow().lock().unwrap().push(val);
-        outputs.push(format!("${}", current_count))
+        
+        let pushed = match *PARAM_STYLE.borrow() {
+            ParamStyle::Numeric => format!("${}", current_count),
+            ParamStyle::QMark => "?".to_string()
+        };
+        outputs.push(pushed)
     }
 
     let final_output = outputs.join(", ");
@@ -155,7 +167,7 @@ impl JinjaSqlBuilder {
             // "pyformat" => ParamStyle::PyFormat,
             // "format" => ParamStyle::Format,
             // "asyncpg" => ParamStyle::AsyncPg,
-            // "qmark" => ParamStyle::QMark,
+            "qmark" => ParamStyle::QMark,
             "numeric" => ParamStyle::Numeric,
             // "named" => ParamStyle::Named,
             _ => {
@@ -184,12 +196,15 @@ impl JinjaSqlBuilder {
 
     pub fn build(self) -> JinjaSql<'static> {
         let env = Environment::new();
-
         let mut j = JinjaSql {
             param_style: self.param_style,
             identifier_quote_character: self.identifier_quote_character,
             env
         };
+
+        // set the param style
+        let mut x = PARAM_STYLE.try_borrow_mut().unwrap();
+        *x = j.param_style.clone();
 
         j.env.add_filter("inclause", bind_in_clause);
         j.env.add_filter("bind", bind);
@@ -209,7 +224,7 @@ mod tests {
         let mut s = Source::new();
         s.load_from_path("./templates", &["j2"]).unwrap();
         
-        let j = JinjaSqlBuilder::new().set_source(s).build();        
+        let j = JinjaSqlBuilder::new().set_param_style("qmark").set_source(s).build();        
         let (res, params) = j
             .render_query(
                 None,
