@@ -69,12 +69,12 @@ impl<'a> JinjaSql<'a> {
         query: &'a str,
         context: Value,
     ) -> Result<(String, Vec<String>), Error> {
-        let name = JinjaSql::hash_query(&query);
-
-        let static_n: &str = Box::leak(name.into_boxed_str());
         
-        self.env.add_template(static_n, &query)?;
-        let tmpl = self.env.get_template(static_n)?;
+        let name = JinjaSql::hash_query(&query);
+        let long_lived_name: &'a str = Box::leak(name.into_boxed_str());
+        
+        self.env.add_template(long_lived_name, &query)?;
+        let tmpl = self.env.get_template(long_lived_name)?;
         let res = tmpl.render(context)?;
         let ctx = CONTEXT.borrow().lock().unwrap().to_vec();
 
