@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use minijinja::value::Value;
 use minijinja::Error;
-use minijinja::{Environment, State, Source};
+use minijinja::{Environment, Source, State};
 
 ref_thread_local! {
     static managed CONTEXT: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -19,15 +19,16 @@ ref_thread_local! {
 enum ParamStyle {
     Numeric,
     QMark,
-    // Named,
-    // Format,
+    Format,
+    AsyncPg,
     // PyFormat,
-    // AsyncPg,
+    // Named,
 }
 
 impl Default for ParamStyle {
     fn default() -> Self {
-        ParamStyle::Numeric
+        // coincidentally this is what rust's postgresql crate uses
+        ParamStyle::AsyncPg
     }
 }
 
@@ -48,7 +49,7 @@ pub struct JinjaSql<'a> {
     param_style: ParamStyle,
     identifier_quote_character: IDQuoteChar,
     // currently the top two are not used, but placeholders for settings.
-    env: Environment<'a>
+    env: Environment<'a>,
 }
 
 impl<'a> JinjaSql<'a> {
@@ -72,24 +73,22 @@ impl<'a> JinjaSql<'a> {
         template_name: Option<&str>,
         context: Value,
     ) -> Result<(String, Vec<String>), Error> {
-        
-        let tmpl =  
-            if let Some(q) = query {
-                let name = JinjaSql::hash_query(q);
-                // TODO: don't leak (if possible)
-                // we are leaking memory here due to lifetimes, the name of the 
-                // string has to live for the duration of the environment, which we "solve"
-                // by just making it live for the lifetime 'a, which is effectively the length
-                // of the entire progrm. 
-                let long_lived_name: &'a str = Box::leak(name.into_boxed_str());
-                self.env.add_template(long_lived_name, q)?;
-                self.env.get_template(long_lived_name)?
-            } else if let Some(b) = template_name {
-                self.env.get_template(b)?
-            } else {
-                panic!("Unreconcilable issue with template args.")
+        let tmpl = if let Some(q) = query {
+            let name = JinjaSql::hash_query(q);
+            // TODO: don't leak (if possible)
+            // we are leaking memory here due to lifetimes, the name of the
+            // string has to live for the duration of the environment, which we "solve"
+            // by just making it live for the lifetime 'a, which is effectively the length
+            // of the entire progrm.
+            let long_lived_name: &'a str = Box::leak(name.into_boxed_str());
+            self.env.add_template(long_lived_name, q)?;
+            self.env.get_template(long_lived_name)?
+        } else if let Some(b) = template_name {
+            self.env.get_template(b)?
+        } else {
+            panic!("Unreconcilable issue with template args.")
         };
-        
+
         let res = tmpl.render(context)?;
         let ctx = CONTEXT.borrow().lock().unwrap().to_vec();
 
@@ -104,15 +103,15 @@ impl<'a> JinjaSql<'a> {
 
 // filter used for binding a single "naked" variable, outside of an in-clause or identity expression
 // eg. WHERE date = {{ date }} => WHERE date = "2020-10-01"
-pub fn bind(_state: &State, value: String) -> Result<String, Error> {    
+pub fn bind(_state: &State, value: String) -> Result<String, Error> {
     let current_count = PARAM_COUNT.borrow().fetch_add(1, Ordering::SeqCst) + 1;
     CONTEXT.borrow().lock().unwrap().push(value.clone());
-    
+
     match *PARAM_STYLE.borrow() {
-        ParamStyle::Numeric => {
-            Ok(format!("${}", current_count))
-        },
-        ParamStyle::QMark => Ok("?".to_string())
+        ParamStyle::Numeric => Ok(format!(":{}", current_count)),
+        ParamStyle::QMark => Ok("?".to_string()),
+        ParamStyle::Format => Ok("%s".to_string()),
+        ParamStyle::AsyncPg => Ok(format!("${}", current_count)),
     }
 }
 
@@ -124,17 +123,17 @@ pub fn bind_in_clause(_state: &State, value: Vec<String>) -> Result<String, Erro
     for val in value {
         let current_count = PARAM_COUNT.borrow().fetch_add(1, Ordering::SeqCst) + 1;
         CONTEXT.borrow().lock().unwrap().push(val);
-        
+
         let pushed = match *PARAM_STYLE.borrow() {
-            ParamStyle::Numeric => format!("${}", current_count),
-            ParamStyle::QMark => "?".to_string()
+            ParamStyle::Numeric => format!(":{}", current_count),
+            ParamStyle::QMark => "?".to_string(),
+            ParamStyle::Format => "%s".to_string(),
+            ParamStyle::AsyncPg => format!("${}", current_count),
         };
         outputs.push(pushed)
     }
 
-    let final_output = outputs.join(", ");
-    let res = format!("({})", &final_output);
-
+    let res = format!("({})", &outputs.join(", "));
     Ok(res)
 }
 
@@ -143,7 +142,7 @@ pub struct JinjaSqlBuilder {
     // Probably lots of optional fields.
     param_style: ParamStyle,
     identifier_quote_character: IDQuoteChar,
-    source: Source
+    source: Source,
 }
 
 impl JinjaSqlBuilder {
@@ -151,7 +150,7 @@ impl JinjaSqlBuilder {
         JinjaSqlBuilder {
             param_style: ParamStyle::default(),
             identifier_quote_character: IDQuoteChar::default(),
-            source: Source::default()
+            source: Source::default(),
         }
     }
 
@@ -162,16 +161,16 @@ impl JinjaSqlBuilder {
 
     // currently doesn't do anything, as only 'Numeric' is supported in pure rust,
     // eg. the rust-postgresql crate
-    pub fn set_param_style(mut self, s: &str) -> JinjaSqlBuilder {
-        let param_style = match s {
-            // "pyformat" => ParamStyle::PyFormat,
-            // "format" => ParamStyle::Format,
-            // "asyncpg" => ParamStyle::AsyncPg,
-            "qmark" => ParamStyle::QMark,
+    pub fn set_param_style(mut self, style: &str) -> JinjaSqlBuilder {
+        let param_style = match style {
             "numeric" => ParamStyle::Numeric,
+            "format" => ParamStyle::Format,
+            "qmark" => ParamStyle::QMark,
             // "named" => ParamStyle::Named,
+            // "pyformat" => ParamStyle::PyFormat,
+            "asyncpg" => ParamStyle::AsyncPg,
             _ => {
-                println!("Paramstyle {} not found. Falling back to default.", s);
+                println!("Paramstyle {} not found. Falling back to default.", style);
                 ParamStyle::default()
             }
         };
@@ -199,7 +198,7 @@ impl JinjaSqlBuilder {
         let mut j = JinjaSql {
             param_style: self.param_style,
             identifier_quote_character: self.identifier_quote_character,
-            env
+            env,
         };
 
         // set the param style
@@ -223,8 +222,11 @@ mod tests {
     fn test_basic_render_source() {
         let mut s = Source::new();
         s.load_from_path("./templates", &["j2"]).unwrap();
-        
-        let j = JinjaSqlBuilder::new().set_param_style("qmark").set_source(s).build();        
+
+        let j = JinjaSqlBuilder::new()
+            .set_param_style("asyncpg")
+            .set_source(s)
+            .build();
         let (res, params) = j
             .render_query(
                 None,
@@ -239,7 +241,6 @@ mod tests {
         println!("{}", res);
         println!("{:?}", params);
     }
-
 
     #[test]
     fn test_basic_render() {
@@ -284,9 +285,9 @@ mod tests {
         "};
 
         let (res, params) = j
-        .render_query(
-            Some(query_string),
-            None,
+            .render_query(
+                Some(query_string),
+                None,
                 context!(
                     columns => vec!["apple", "lettuce", "lemon"],
                     table_name => "orders.stock_data",
@@ -302,8 +303,8 @@ mod tests {
 
         assert_eq!(
             res,
-            indoc! { 
-        "select
+            indoc! {
+            "select
             apple,
             lettuce,
             lemon
@@ -318,7 +319,7 @@ mod tests {
         where 
             tag in ($4, $5, $6)
             and stock_date = $7"
-            }
+                }
         );
 
         assert_eq!(
@@ -349,9 +350,9 @@ mod tests {
             println!("Running from thread!");
             let j = JinjaSqlBuilder::new().build();
             let (res, params) = j
-            .render_query(
-                Some(query_string),
-                None,
+                .render_query(
+                    Some(query_string),
+                    None,
                     context!(
                 table_name => "thread",
                 items => vec!["a", "b", "c"],
@@ -365,9 +366,9 @@ mod tests {
         println!("Running from main!");
         let j = JinjaSqlBuilder::new().build();
         let (res, params) = j
-        .render_query(
-            Some(query_string),
-            None,
+            .render_query(
+                Some(query_string),
+                None,
                 context!(
             table_name => "main",
             items => vec!["a", "b", "c"],
