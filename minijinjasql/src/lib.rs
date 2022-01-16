@@ -1,7 +1,10 @@
 #[macro_use]
 extern crate ref_thread_local;
 use ref_thread_local::RefThreadLocal;
+use std::fmt;
 
+use std::io::{Error as IOError, ErrorKind};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -33,7 +36,7 @@ impl Default for ParamStyle {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-enum IDQuoteChar {
+pub enum IDQuoteChar {
     Backtick,
     DoubleQuote,
 }
@@ -43,6 +46,32 @@ impl Default for IDQuoteChar {
         IDQuoteChar::DoubleQuote
     }
 }
+
+impl fmt::Display for IDQuoteChar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            IDQuoteChar::Backtick => f.write_str("`"),
+            IDQuoteChar::DoubleQuote => f.write_str(r#"""#)
+        }
+    }
+}
+
+impl std::error::Error for IDQuoteChar {}
+
+impl FromStr for IDQuoteChar {    
+    type Err = std::io::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let res = match s {
+            "`" => Ok(IDQuoteChar::Backtick),
+            r#"""# => Ok(IDQuoteChar::DoubleQuote),
+            _ => {
+                Err(IOError::new(ErrorKind::Other, "String parsing failed."))
+            }
+        };
+        res
+    }
+}
+
 
 #[derive(Debug, Clone)]
 pub struct JinjaSql<'a> {
@@ -65,6 +94,18 @@ impl<'a> JinjaSql<'a> {
         format!("hash:{:x}", hash)
     }
 
+    // pub fn make_identifier_filter(&'a mut self) ->  Box<dyn Fn(&State, Vec<String>) -> Result<String, Error> + 'a> {
+    //     let test_function = move | value: &str |  {
+    //         let quote_str = &self.identifier_quote_character.to_string();
+    //         let a = quote_str.to_owned() + &value.replace(quote_str, &quote_str.repeat(2)) + quote_str;
+    //         a.to_owned()
+    //     };
+    
+    //     let res = move |_state: &State, value: Vec<String> | Ok(value.iter().map(|x| test_function(x)).collect::<Vec<String>>().join("."));
+    //     Box::new(res)
+    // }
+
+
     // make our template from a query string (or template path)
     // render it and return back the render query and param vec
     pub fn render_query(
@@ -79,7 +120,7 @@ impl<'a> JinjaSql<'a> {
             // we are leaking memory here due to lifetimes, the name of the
             // string has to live for the duration of the environment, which we "solve"
             // by just making it live for the lifetime 'a, which is effectively the length
-            // of the entire progrm.
+            // of the entire program.
             let long_lived_name: &'a str = Box::leak(name.into_boxed_str());
             self.env.add_template(long_lived_name, q)?;
             self.env.get_template(long_lived_name)?
@@ -100,6 +141,11 @@ impl<'a> JinjaSql<'a> {
         Ok((res, ctx))
     }
 }
+
+
+
+
+
 
 // filter used for binding a single "naked" variable, outside of an in-clause or identity expression
 // eg. WHERE date = {{ date }} => WHERE date = "2020-10-01"
@@ -180,14 +226,7 @@ impl JinjaSqlBuilder {
     }
 
     pub fn set_identifier_quote_character(mut self, c: &str) -> JinjaSqlBuilder {
-        let iqc = match c {
-            "`" => IDQuoteChar::Backtick,
-            r#"""# => IDQuoteChar::DoubleQuote,
-            _ => {
-                println!("Quote char {} not found. Falling back to default!", c);
-                IDQuoteChar::default()
-            }
-        };
+        let iqc = IDQuoteChar::from_str(c).unwrap();
 
         self.identifier_quote_character = iqc;
         self
@@ -201,12 +240,15 @@ impl JinjaSqlBuilder {
             env,
         };
 
+        // let func = *j.make_identifier_filter();
+
         // set the param style
         let mut x = PARAM_STYLE.try_borrow_mut().unwrap();
         *x = j.param_style.clone();
 
         j.env.add_filter("inclause", bind_in_clause);
         j.env.add_filter("bind", bind);
+        // j.env.add_filter("identifier", func);
         j.env.set_source(self.source);
         j
     }
@@ -336,7 +378,7 @@ mod tests {
         );
     }
 
-    // test to ensure that our 'globals' implementation is thead-safe
+    // test to ensure that our 'thread locals' implementation is thead-safe
     #[test]
     fn test_basic_render_threads() {
         use std::thread;
