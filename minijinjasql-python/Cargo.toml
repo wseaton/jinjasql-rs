@@ -1,0 +1,19 @@
+
+[package]
+name = "minijinjasql-python"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.cargo-udeps.ignore]
+normal = ["anyhow", "indoc"]
+
+
+[dependencies]
+minijinja = {version = "0.12.0", features = ["source"]}
+minijinjasql = {path = "../minijinjasql", default-features = false}
+pyo3 = {version = "0.14", default-features = false, features = ["macros", "hashbrown", "extension-module"]}
+pythonize = "0.14.0"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+name = "minijinjasql_python"

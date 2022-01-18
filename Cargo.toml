@@ -1,15 +1,7 @@
-[package]
-name = "minijinjasql"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+default-members = ["minijinjasql"]
+members = ["minijinjasql", "minijinjasql-python"]
 
-[package.metadata.cargo-udeps.ignore]
-normal = ["anyhow", "indoc"]
-
-
-[dependencies]
-ref_thread_local = "0.1.1"
-minijinja = {version = "0.10.0", features = ["source"]}
-sha2 = "0.10"
-anyhow = "*"
-indoc = "1.0"
+[profile.release]
+debug = true
+lto = true
